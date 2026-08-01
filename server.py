@@ -1,133 +1,223 @@
+#!/usr/bin/env python3
 """
-infrastructure/docker/modbus_sim/server.py
-==========================================
-Simulador Modbus TCP para BESSAI Edge Gateway (dev/test).
-Usa pymodbus 3.x (mismo del proyecto) y simula todos los registros
-SUN2000 + LUNA2000 con valores realistas.
-
-Puerto: 502  (mapeado a 5020 en el host)
-Unit ID: 1   (gateway-sim usa slave_id=1, gateway usa 3)
+server.py
+=========
+Universal Modbus TCP Simulator for BESS Solutions.
+Loads any device profile JSON and dynamically populates holding registers,
+simulating live telemetry with data-type and endianness awareness.
 """
-from __future__ import annotations
-
+import os
+import sys
+import json
+import argparse
 import asyncio
 import logging
 import struct
+import math
+import random
+import time
 
 from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext, ModbusDeviceContext
 from pymodbus.pdu.device import ModbusDeviceIdentification
 from pymodbus.server import StartAsyncTcpServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("bessai-sim")
+log = logging.getLogger("bess-sim")
 
-# ---------------------------------------------------------------------------
-# Register values — SUN2000-2-6KTL-L1 + LUNA2000 (realistic sunny day)
-# ---------------------------------------------------------------------------
-# Modbus holding registers are addressed 0-based internally in pymodbus,
-# but the Modbus protocol uses 1-based, pymodbus handles the offset.
-# We use address as-is matching the device spec (40001 offset not needed
-# for read_holding_registers which is 0-based internally).
-# We create a block large enough to cover all registers (0 to 50000).
+class UniversalBessSimulator:
+    def __init__(self, profile_path: str):
+        self.profile_path = profile_path
+        self.profile = self.load_profile()
+        self.device = self.profile.get("device", {})
+        self.conn_cfg = self.profile.get("connection", {})
+        self.registers = self.profile.get("registers", {})
+        
+        # Endianness setup
+        self.byte_order = self.conn_cfg.get("byte_order", "BIG").upper()
+        self.word_order = self.conn_cfg.get("word_order", "BIG").upper()
+        
+        # Find maximum register address to size the block
+        max_addr = 1000
+        for reg in self.registers.values():
+            addr = reg.get("address", 0)
+            reg_type = reg.get("type", "INT16").upper()
+            size = 2 if "32" in reg_type else 1
+            max_addr = max(max_addr, addr + size)
+            
+        self.block_size = max_addr + 10
+        self.data_block = [0] * self.block_size
+        
+        # Initialize default register values
+        self.init_register_values()
+        
+    def load_profile(self) -> dict:
+        log.info(f"Loading device profile: {self.profile_path}")
+        with open(self.profile_path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-def _make_block() -> ModbusSequentialDataBlock:
-    """Build a large zero-filled block and set known register values."""
-    SIZE = 50000
-    data = [0] * SIZE
+    def write_val(self, address: int, val: float, reg_type: str, scale: float):
+        # Apply inverse scale
+        scaled_val = int(val / scale)
+        reg_type = reg_type.upper()
+        
+        # Determine struct format based on type and endianness
+        fmt_char = "h"  # default signed 16-bit
+        if reg_type == "UINT16":
+            fmt_char = "H"
+        elif reg_type == "INT32":
+            fmt_char = "i"
+        elif reg_type == "UINT32":
+            fmt_char = "I"
+        elif reg_type == "FLOAT32":
+            fmt_char = "f"
 
-    # ── Inverter state ──────────────────────────────────────────────────────
-    data[32089] = 256          # Running / Grid Connected
+        prefix = ">" if self.byte_order == "BIG" else "<"
+        
+        try:
+            packed = struct.pack(f"{prefix}{fmt_char}", scaled_val if reg_type != "FLOAT32" else float(scaled_val))
+        except Exception as e:
+            # Fallback to unsigned default on packing overflow
+            packed = struct.pack(f"{prefix}h", 0)
+            
+        if len(packed) == 2:
+            self.data_block[address] = int.from_bytes(packed, byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
+        elif len(packed) == 4:
+            # Split 32-bit into two 16-bit registers
+            r1 = int.from_bytes(packed[0:2], byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
+            r2 = int.from_bytes(packed[2:4], byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
+            
+            if self.word_order == "BIG":
+                self.data_block[address] = r1
+                self.data_block[address + 1] = r2
+            else:
+                self.data_block[address] = r2
+                self.data_block[address + 1] = r1
 
-    # ── PV strings ───────────────────────────────────────────────────────────
-    data[32016] = 3600         # PV1 voltage 360.0V (INT16, *0.1)
-    data[32017] = 850          # PV1 current 8.50A  (INT16, *0.01)
-    data[32018] = 3550         # PV2 voltage 355.0V
-    data[32019] = 820          # PV2 current 8.20A
+    def init_register_values(self):
+        """Set logical defaults based on typical register tags."""
+        for name, reg in self.registers.items():
+            addr = reg.get("address")
+            reg_type = reg.get("type", "INT16")
+            scale = reg.get("scale", 1.0)
+            tag = name.lower()
+            
+            # Default values depending on tag name
+            val = 0.0
+            if "soc" in tag or "stateofcharge" in tag:
+                val = 75.0
+            elif "soh" in tag or "stateofhealth" in tag:
+                val = 98.5
+            elif "frequency" in tag:
+                val = 50.00
+            elif "temp" in tag:
+                val = 24.5
+            elif "voltage" in tag or "volt" in tag:
+                val = 380.0 if addr > 30000 else 230.0
+            elif "activepower" in tag:
+                val = 1500.0
+            elif "running" in tag or "state" in tag:
+                val = 256.0 # standard running enum for many inverters
+                
+            self.write_val(addr, val, reg_type, scale)
 
-    # ── PV total power INT32 5800W = 5.8kW ──────────────────────────────────
-    pv_power = struct.pack(">i", 5800)
-    data[32064] = int.from_bytes(pv_power[0:2], "big")
-    data[32065] = int.from_bytes(pv_power[2:4], "big")
+    async def simulation_loop(self, datablock_wrapper: ModbusSequentialDataBlock):
+        """Simulate physical grid fluctuations and battery dynamics."""
+        start_time = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start_time
+            
+            # 1. Fluctuating grid frequency around 50.00 Hz
+            freq = 50.00 + 0.02 * math.sin(elapsed / 10.0) + random.uniform(-0.005, 0.005)
+            
+            # 2. Charging/Discharging SOC cycle (discharges during simulation)
+            soc = 75.0 - (elapsed / 60.0) % 55.0
+            
+            # 3. Dynamic active power
+            power = 1200.0 + 300.0 * math.sin(elapsed / 15.0)
 
-    # ── AC output ────────────────────────────────────────────────────────────
-    data[32069] = 2300         # AC voltage 230.0V  (UINT16, *0.1)
-    # AC power INT32 5750W = 5.75kW
-    ac_power = struct.pack(">i", 5750)
-    data[32080] = int.from_bytes(ac_power[0:2], "big")
-    data[32081] = int.from_bytes(ac_power[2:4], "big")
-    data[32085] = 5000         # Frequency 50.00Hz  (UINT16, *0.01)
-    data[32087] = 420          # Temp 42.0°C        (INT16, *0.1)
+            # 4. Temperature rising slightly
+            temp = 24.5 + 2.0 * math.sin(elapsed / 120.0)
 
-    # ── Alarms (none) ────────────────────────────────────────────────────────
-    data[32008] = 0x0000
-    data[32009] = 0x0000
+            for name, reg in self.registers.items():
+                addr = reg.get("address")
+                reg_type = reg.get("type", "INT16")
+                scale = reg.get("scale", 1.0)
+                tag = name.lower()
+                
+                val = None
+                if "soc" in tag or "stateofcharge" in tag:
+                    val = soc
+                elif "frequency" in tag:
+                    val = freq
+                elif "activepower" in tag:
+                    val = power
+                elif "temp" in tag:
+                    val = temp
+                
+                if val is not None:
+                    self.write_val(addr, val, reg_type, scale)
+            
+            # Sync local datablock with the Modbus running store
+            # ModbusSequentialDataBlock uses 1-based address offset matching start address
+            datablock_wrapper.values = self.data_block[1:]
+            
+            await asyncio.sleep(2.0)
 
-    # ── Energy ───────────────────────────────────────────────────────────────
-    # daily_energy: 28.50 kWh → UINT32 = 2850 (scale 0.01)
-    daily = struct.pack(">I", 2850)
-    data[32114] = int.from_bytes(daily[0:2], "big")
-    data[32115] = int.from_bytes(daily[2:4], "big")
-    # total_energy: 5280.00 kWh → UINT32 = 528000
-    total = struct.pack(">I", 528000)
-    data[32106] = int.from_bytes(total[0:2], "big")
-    data[32107] = int.from_bytes(total[2:4], "big")
+def main():
+    parser = argparse.ArgumentParser(description="Universal Modbus BESS Simulator")
+    parser.add_argument("--profile", type=str, default="profiles/huawei_sun2000.json", help="Path to device profile JSON")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Binding host address")
+    parser.add_argument("--port", type=int, default=5020, help="Binding TCP port")
+    args = parser.parse_args()
 
-    # ── LUNA2000 battery ─────────────────────────────────────────────────────
-    data[37752] = 260          # temperature 26.0°C (INT16, *0.1)
-    data[37760] = 750          # SOC  75.0%         (UINT16, *0.1)
-    data[37761] = 980          # SOH  98.0%         (UINT16, *0.1)
-    data[37762] = 88           # cycle count
-    # luna_capacity UINT32 14000 Wh = 14.0 kWh (scale 0.001)
-    cap = struct.pack(">I", 14000)
-    data[37758] = int.from_bytes(cap[0:2], "big")
-    data[37759] = int.from_bytes(cap[2:4], "big")
-    # luna_power INT32 -2500 W = -2.5 kW discharging (scale 0.001)
-    pwr = struct.pack(">i", -2500)
-    data[37765] = int.from_bytes(pwr[0:2], "big")
-    data[37766] = int.from_bytes(pwr[2:4], "big")
-    data[37800] = 4750         # voltage 475.0V (UINT16, *0.1)
-    data[37801] = 0xFFCE       # current -5.0A  (INT16 two's complement -50, *0.1)
+    # Validate path exists
+    if not os.path.exists(args.profile):
+        # Attempt to resolve from subdirectory
+        local_path = os.path.join(os.path.dirname(__file__), args.profile)
+        if os.path.exists(local_path):
+            args.profile = local_path
+        else:
+            log.error(f"Profile path '{args.profile}' not found.")
+            sys.exit(1)
 
-    # ── Working mode (RW) ────────────────────────────────────────────────────
-    data[47086] = 0            # MAX_SELF_CONSUMPTION
-    data[47087] = 900          # target SOC 90.0%
-
-    # ── Watchdog heartbeat (RW) ───────────────────────────────────────────────
-    data[40900] = 0
-
-    # NOTA (fix 30-jul-2026): en pymodbus >= 3.10, ModbusSequentialDataBlock
-    # resta 1 internamente a la dirección inicial (SimData(address-1, ...)).
-    # Se pasa 1 en vez de 0 para preservar el mapeo original (registro lógico i -> data[i]).
-    return ModbusSequentialDataBlock(1, data)
-
-
-async def run_server() -> None:
-    block = _make_block()
-
-    # One slave for all unit IDs (gateway uses 3, gateway-sim uses 1)
-    # NOTA (fix 30-jul-2026): pymodbus >= 3.10 rechaza que dos device_id
-    # distintos compartan la misma instancia de ModbusDeviceContext
-    # ("device_id: 3 in multiple SimDevice entries"). Se crea un segundo
-    # contexto independiente (mismos valores) para el unit id 3.
-    slave = ModbusDeviceContext(hr=block)
-    slave3 = ModbusDeviceContext(hr=_make_block())
-    context = ModbusServerContext(devices={1: slave, 3: slave3}, single=False)
-
+    sim = UniversalBessSimulator(args.profile)
+    
+    # pymodbus holding registers offset: start at address 1 to allow direct 1-to-1 index matching
+    store = ModbusSequentialDataBlock(1, sim.data_block[1:])
+    slave1 = ModbusSlaveContext(di=store, co=store, hr=store, ir=store)
+    
+    # Create independent block and context for slave 3 to avoid share exceptions
+    store3 = ModbusSequentialDataBlock(1, sim.data_block[1:])
+    slave3 = ModbusSlaveContext(di=store3, co=store3, hr=store3, ir=store3)
+    
+    server_context = ModbusServerContext(devices={1: slave1, 3: slave3}, single=False)
+    
     identity = ModbusDeviceIdentification()
-    identity.VendorName = "BESSAI-SIM"
-    identity.ProductCode = "SUN2000-SIM"
-    identity.VendorUrl = "https://github.com/bess-solutions/open-bess-edge"
-    identity.ProductName = "BESSAI Modbus Simulator"
-    identity.ModelName = "SUN2000-2-6KTL-L1-SIM"
-    identity.MajorMinorRevision = "v1.0.0"
+    identity.VendorName = sim.device.get("manufacturer", "BESS Solutions")
+    identity.ProductCode = "BESS-SIM-V2"
+    identity.ModelName = sim.device.get("model", "Universal Inverter")
 
-    log.info("Starting BESSAI Modbus simulator on 0.0.0.0:502")
-    await StartAsyncTcpServer(
-        context=context,
-        identity=identity,
-        address=("0.0.0.0", 502),
+    # Start simulation loop task
+    loop = asyncio.get_event_loop()
+    loop.create_task(sim.simulation_loop(store))
+
+    log.info(f"Starting Universal Modbus TCP Server on {args.host}:{args.port}")
+    log.info(f"Simulating: {identity.VendorName} - {identity.ModelName}")
+    
+    loop.run_until_complete(
+        StartAsyncTcpServer(
+            context=server_context,
+            identity=identity,
+            address=(args.host, args.port)
+        )
     )
 
+# Compatibility fix: ModbusSlaveContext name can be import-dependent in some pymodbus versions
+try:
+    from pymodbus.datastore import ModbusSlaveContext
+except ImportError:
+    # Fallback to ModbusDeviceContext if SlaveContext doesn't exist
+    ModbusSlaveContext = ModbusDeviceContext
 
 if __name__ == "__main__":
-    asyncio.run(run_server())
+    main()
