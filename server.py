@@ -5,6 +5,7 @@ server.py
 Universal Modbus TCP Simulator for BESS Solutions.
 Loads any device profile JSON and dynamically populates holding registers,
 simulating live telemetry with data-type and endianness awareness.
+Fully compatible across pymodbus 3.8.x - 3.15.x.
 """
 import os
 import sys
@@ -17,12 +18,25 @@ import math
 import random
 import time
 
+# --- Pymodbus Cross-Version Compatibility Layer ---
 from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext
 try:
-    from pymodbus.datastore import ModbusDeviceContext
+    from pymodbus.datastore import ModbusDeviceContext as _ContextClass
 except ImportError:
-    from pymodbus.datastore import ModbusSlaveContext as ModbusDeviceContext
-from pymodbus.pdu.device import ModbusDeviceIdentification
+    from pymodbus.datastore import ModbusSlaveContext as _ContextClass
+
+# Export both names to prevent NameError in all versions
+ModbusDeviceContext = _ContextClass
+ModbusSlaveContext = _ContextClass
+
+try:
+    from pymodbus.pdu.device import ModbusDeviceIdentification
+except ImportError:
+    try:
+        from pymodbus.device import ModbusDeviceIdentification
+    except ImportError:
+        ModbusDeviceIdentification = None
+
 from pymodbus.server import StartAsyncTcpServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -45,10 +59,10 @@ class UniversalBessSimulator:
         for reg in self.registers.values():
             addr = reg.get("address", 0)
             reg_type = reg.get("type", "INT16").upper()
-            size = 2 if "32" in reg_type else 1
+            size = 2 if any(k in reg_type for k in ["32", "FLOAT"]) else 1
             max_addr = max(max_addr, addr + size)
             
-        self.block_size = max_addr + 10
+        self.block_size = max_addr + 50
         self.data_block = [0] * self.block_size
         
         # Initialize default register values
@@ -59,68 +73,67 @@ class UniversalBessSimulator:
         with open(self.profile_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def write_val(self, address: int, val: float, reg_type: str, scale: float):
-        # Apply inverse scale
-        scaled_val = int(val / scale)
-        reg_type = reg_type.upper()
+    def write_val(self, addr: int, val: float, reg_type: str, scale: float = 1.0):
+        if addr is None or addr <= 0:
+            return
         
-        # Determine struct format based on type and endianness
-        fmt_char = "h"  # default signed 16-bit
-        if reg_type == "UINT16":
-            fmt_char = "H"
-        elif reg_type == "INT32":
-            fmt_char = "i"
-        elif reg_type == "UINT32":
-            fmt_char = "I"
-        elif reg_type == "FLOAT32":
-            fmt_char = "f"
-
-        prefix = ">" if self.byte_order == "BIG" else "<"
+        reg_type = reg_type.upper()
+        scaled_val = val / scale if scale != 0 else val
+        
+        bo = ">" if self.byte_order == "BIG" else "<"
         
         try:
-            packed = struct.pack(f"{prefix}{fmt_char}", scaled_val if reg_type != "FLOAT32" else float(scaled_val))
+            if reg_type in ["UINT16", "ENUM16"]:
+                raw = int(max(0, min(65535, round(scaled_val))))
+                self.data_block[addr] = raw
+            elif reg_type == "INT16":
+                raw = int(max(-32768, min(32767, round(scaled_val))))
+                packed = struct.pack(f"{bo}h", raw)
+                self.data_block[addr] = struct.unpack(f"{bo}H", packed)[0]
+            elif reg_type in ["UINT32", "INT32"]:
+                fmt = "I" if reg_type == "UINT32" else "i"
+                raw = int(round(scaled_val))
+                packed = struct.pack(f"{bo}{fmt}", raw)
+                w0, w1 = struct.unpack(f"{bo}HH", packed)
+                if self.word_order == "LITTLE":
+                    w0, w1 = w1, w0
+                self.data_block[addr] = w0
+                self.data_block[addr + 1] = w1
+            elif reg_type == "FLOAT32":
+                packed = struct.pack(f"{bo}f", float(scaled_val))
+                w0, w1 = struct.unpack(f"{bo}HH", packed)
+                if self.word_order == "LITTLE":
+                    w0, w1 = w1, w0
+                self.data_block[addr] = w0
+                self.data_block[addr + 1] = w1
         except Exception as e:
-            # Fallback to unsigned default on packing overflow
-            packed = struct.pack(f"{prefix}h", 0)
-            
-        if len(packed) == 2:
-            self.data_block[address] = int.from_bytes(packed, byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
-        elif len(packed) == 4:
-            # Split 32-bit into two 16-bit registers
-            r1 = int.from_bytes(packed[0:2], byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
-            r2 = int.from_bytes(packed[2:4], byteorder="big" if self.byte_order == "BIG" else "little", signed=False)
-            
-            if self.word_order == "BIG":
-                self.data_block[address] = r1
-                self.data_block[address + 1] = r2
-            else:
-                self.data_block[address] = r2
-                self.data_block[address + 1] = r1
+            log.warning(f"Failed to encode value {val} at address {addr} ({reg_type}): {e}")
 
     def init_register_values(self):
-        """Set logical defaults based on typical register tags."""
+        """Populate initial holding register baseline values."""
         for name, reg in self.registers.items():
             addr = reg.get("address")
             reg_type = reg.get("type", "INT16")
             scale = reg.get("scale", 1.0)
             tag = name.lower()
             
-            # Default values depending on tag name
             val = 0.0
-            if "soc" in tag or "stateofcharge" in tag:
+            if "voltage" in tag:
+                val = 400.0 if "ac" in tag or "grid" in tag else 800.0
+            elif "current" in tag:
+                val = 25.0
+            elif "frequency" in tag:
+                val = 50.00
+            elif "soc" in tag or "stateofcharge" in tag:
                 val = 75.0
             elif "soh" in tag or "stateofhealth" in tag:
                 val = 98.5
-            elif "frequency" in tag:
-                val = 50.00
             elif "temp" in tag:
                 val = 24.5
-            elif "voltage" in tag or "volt" in tag:
-                val = 380.0 if addr > 30000 else 230.0
             elif "activepower" in tag:
                 val = 1500.0
             elif "running" in tag or "state" in tag:
-                val = 256.0 # standard running enum for many inverters
+                val = 256.0
                 
             self.write_val(addr, val, reg_type, scale)
 
@@ -129,17 +142,9 @@ class UniversalBessSimulator:
         start_time = time.monotonic()
         while True:
             elapsed = time.monotonic() - start_time
-            
-            # 1. Fluctuating grid frequency around 50.00 Hz
             freq = 50.00 + 0.02 * math.sin(elapsed / 10.0) + random.uniform(-0.005, 0.005)
-            
-            # 2. Charging/Discharging SOC cycle (discharges during simulation)
             soc = 75.0 - (elapsed / 60.0) % 55.0
-            
-            # 3. Dynamic active power
             power = 1200.0 + 300.0 * math.sin(elapsed / 15.0)
-
-            # 4. Temperature rising slightly
             temp = 24.5 + 2.0 * math.sin(elapsed / 120.0)
 
             for name, reg in self.registers.items():
@@ -161,11 +166,44 @@ class UniversalBessSimulator:
                 if val is not None:
                     self.write_val(addr, val, reg_type, scale)
             
-            # Sync local datablock with the Modbus running store
-            # ModbusSequentialDataBlock uses 1-based address offset matching start address
-            datablock_wrapper.values = self.data_block[1:]
-            
+            # Update values in datablock
+            datablock_wrapper.values = self.data_block
             await asyncio.sleep(2.0)
+
+def build_server_context(sim: UniversalBessSimulator):
+    store1 = ModbusSequentialDataBlock(1, sim.data_block)
+    slave1 = ModbusDeviceContext(di=store1, co=store1, hr=store1, ir=store1)
+    
+    store3 = ModbusSequentialDataBlock(1, sim.data_block)
+    slave3 = ModbusDeviceContext(di=store3, co=store3, hr=store3, ir=store3)
+    
+    try:
+        ctx = ModbusServerContext(devices={1: slave1, 3: slave3}, single=False)
+    except TypeError:
+        ctx = ModbusServerContext(slaves={1: slave1, 3: slave3}, single=False)
+    return ctx, store1
+
+async def run_server(args, sim, store, server_context, identity):
+    loop_task = asyncio.create_task(sim.simulation_loop(store))
+    log.info(f"Starting Universal Modbus TCP Server on {args.host}:{args.port}")
+    if identity:
+        log.info(f"Simulating: {getattr(identity, 'VendorName', 'BESS')} - {getattr(identity, 'ModelName', 'Sim')}")
+    
+    kwargs = {
+        "context": server_context,
+        "address": (args.host, args.port),
+    }
+    if identity is not None:
+        kwargs["identity"] = identity
+        
+    try:
+        await StartAsyncTcpServer(**kwargs)
+    finally:
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Modbus BESS Simulator")
@@ -174,9 +212,7 @@ def main():
     parser.add_argument("--port", type=int, default=5020, help="Binding TCP port")
     args = parser.parse_args()
 
-    # Validate path exists
     if not os.path.exists(args.profile):
-        # Attempt to resolve from subdirectory
         local_path = os.path.join(os.path.dirname(__file__), args.profile)
         if os.path.exists(local_path):
             args.profile = local_path
@@ -185,38 +221,19 @@ def main():
             sys.exit(1)
 
     sim = UniversalBessSimulator(args.profile)
+    server_context, store = build_server_context(sim)
     
-    # pymodbus holding registers offset: start at address 1 to allow direct 1-to-1 index matching
-    store = ModbusSequentialDataBlock(1, sim.data_block[1:])
-    slave1 = ModbusSlaveContext(di=store, co=store, hr=store, ir=store)
-    
-    # Create independent block and context for slave 3 to avoid share exceptions
-    store3 = ModbusSequentialDataBlock(1, sim.data_block[1:])
-    slave3 = ModbusSlaveContext(di=store3, co=store3, hr=store3, ir=store3)
-    
-    server_context = ModbusServerContext(devices={1: slave1, 3: slave3}, single=False)
-    
-    identity = ModbusDeviceIdentification()
-    identity.VendorName = sim.device.get("manufacturer", "BESS Solutions")
-    identity.ProductCode = "BESS-SIM-V2"
-    identity.ModelName = sim.device.get("model", "Universal Inverter")
+    identity = None
+    if ModbusDeviceIdentification is not None:
+        identity = ModbusDeviceIdentification()
+        identity.VendorName = sim.device.get("manufacturer", "BESS Solutions")
+        identity.ProductCode = "BESS-SIM-V3"
+        identity.ModelName = sim.device.get("model", "Universal Inverter")
 
-    # Start simulation loop task
-    loop = asyncio.get_event_loop()
-    loop.create_task(sim.simulation_loop(store))
-
-    log.info(f"Starting Universal Modbus TCP Server on {args.host}:{args.port}")
-    log.info(f"Simulating: {identity.VendorName} - {identity.ModelName}")
-    
-    loop.run_until_complete(
-        StartAsyncTcpServer(
-            context=server_context,
-            identity=identity,
-            address=(args.host, args.port)
-        )
-    )
-
-# Compatibility handled in header imports
+    try:
+        asyncio.run(run_server(args, sim, store, server_context, identity))
+    except KeyboardInterrupt:
+        log.info("Server terminated by user.")
 
 if __name__ == "__main__":
     main()

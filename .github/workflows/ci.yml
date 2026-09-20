@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+        pymodbus-version: ["pymodbus==3.9.2", "pymodbus==3.11.4", "pymodbus==3.15.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio pyserial
+          pip install "${{ matrix.pymodbus-version }}"
+      - name: Run E2E server test
+        run: |
+          pytest -v tests/test_server_e2e.py
