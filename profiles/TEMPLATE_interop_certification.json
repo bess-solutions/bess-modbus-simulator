@@ -3,7 +3,9 @@
   "schema_version": "1.0",
   "manufacturer": "REPLACE_MANUFACTURER_NAME",
   "model": "REPLACE_MODEL_NAME",
-  "firmware_versions_tested": ["REPLACE_FIRMWARE_VERSION"],
+  "firmware_versions_tested": [
+    "REPLACE_FIRMWARE_VERSION"
+  ],
   "protocol": "Modbus TCP",
   "default_port": 502,
   "driver_class": "REPLACE_PYTHON_DOTTED_PATH",

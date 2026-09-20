@@ -17,7 +17,11 @@ import math
 import random
 import time
 
-from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext, ModbusDeviceContext
+from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext
+try:
+    from pymodbus.datastore import ModbusDeviceContext
+except ImportError:
+    from pymodbus.datastore import ModbusSlaveContext as ModbusDeviceContext
 from pymodbus.pdu.device import ModbusDeviceIdentification
 from pymodbus.server import StartAsyncTcpServer
 
@@ -212,12 +216,7 @@ def main():
         )
     )
 
-# Compatibility fix: ModbusSlaveContext name can be import-dependent in some pymodbus versions
-try:
-    from pymodbus.datastore import ModbusSlaveContext
-except ImportError:
-    # Fallback to ModbusDeviceContext if SlaveContext doesn't exist
-    ModbusSlaveContext = ModbusDeviceContext
+# Compatibility handled in header imports
 
 if __name__ == "__main__":
     main()
