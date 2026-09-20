@@ -1,13 +1,19 @@
-"""Test E2E real: arranca el servidor Modbus y lee registros por TCP."""
+"""Test E2E real: arranca el servidor Modbus y lee registros por TCP con puerto efímero."""
 import sys
 import os
 import asyncio
+import socket
 import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from server import UniversalBessSimulator, build_server_context, StartAsyncTcpServer
 from pymodbus.client import AsyncModbusTcpClient
+
+def get_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 @pytest.mark.asyncio
 async def test_server_starts_and_responds_to_modbus_client():
@@ -16,7 +22,8 @@ async def test_server_starts_and_responds_to_modbus_client():
     sim = UniversalBessSimulator(prof_path)
     ctx, store = build_server_context(sim)
 
-    port = 25028
+    # Asignación de puerto efímero para evitar colisiones y estados TIME_WAIT en CI
+    port = get_free_port()
     server_task = asyncio.create_task(
         StartAsyncTcpServer(context=ctx, address=("127.0.0.1", port))
     )
@@ -24,7 +31,7 @@ async def test_server_starts_and_responds_to_modbus_client():
 
     client = AsyncModbusTcpClient("127.0.0.1", port=port)
     connected = await client.connect()
-    assert connected is True, "El cliente Modbus no pudo conectar al simulador"
+    assert connected is True, f"El cliente Modbus no pudo conectar al simulador en puerto {port}"
 
     try:
         # address 32069 (ac_voltage, inicializado en 400V / 0.1 scale = 4000)
