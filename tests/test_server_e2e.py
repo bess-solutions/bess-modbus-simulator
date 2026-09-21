@@ -30,7 +30,12 @@ async def test_server_starts_and_responds_to_modbus_client():
     await asyncio.sleep(0.3)
 
     client = AsyncModbusTcpClient("127.0.0.1", port=port)
-    connected = await client.connect()
+    connected = False
+    for _ in range(25):
+        await asyncio.sleep(0.1)
+        connected = await client.connect()
+        if connected:
+            break
     assert connected is True, f"El cliente Modbus no pudo conectar al simulador en puerto {port}"
 
     try:
